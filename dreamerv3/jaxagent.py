@@ -152,7 +152,7 @@ class JAXAgent(embodied.Agent):
     jaxutils.COMPUTE_DTYPE = getattr(jnp, self.config.precision)
 
   def _transform(self):
-    self._init_policy = nj.pure(lambda x: self.agent.policy_initial(len(x)))
+    self._init_policy = nj.pure(lambda x: self.agent.initialize_policy(len(x)))
     self._init_train = nj.pure(lambda x: self.agent.train_initial(len(x)))
     self._policy = nj.pure(self.agent.policy)
     self._train = nj.pure(self.agent.train)

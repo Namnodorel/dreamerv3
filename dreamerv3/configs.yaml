@@ -57,7 +57,7 @@ defaults:
 
   # Agent
   task_behavior: Greedy
-  expl_behavior: None
+  exploration_behavior: None
   batch_size: 16
   batch_length: 64
   data_loaders: 8
@@ -70,8 +70,8 @@ defaults:
   reward_head: {layers: 5, units: 1024, act: silu, norm: layer, dist: symlog_disc, outscale: 0.0, outnorm: False, inputs: [deter, stoch], winit: normal, fan: avg, bins: 255}
   cont_head: {layers: 5, units: 1024, act: silu, norm: layer, dist: binary, outscale: 1.0, outnorm: False, inputs: [deter, stoch], winit: normal, fan: avg}
   loss_scales: {image: 1.0, vector: 1.0, reward: 1.0, cont: 1.0, dyn: 0.5, rep: 0.1, actor: 1.0, critic: 1.0, slowreg: 1.0}
-  dyn_loss: {impl: kl, free: 1.0}
-  rep_loss: {impl: kl, free: 1.0}
+  dynamics_loss: {impl: kl, free: 1.0}
+  representation_loss: {impl: kl, free: 1.0}
   model_opt: {opt: adam, lr: 1e-4, eps: 1e-8, clip: 1000.0, wd: 0.0, warmup: 0, lateclip: 0.0}
 
   # Actor Critic

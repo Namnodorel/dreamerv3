@@ -7,12 +7,13 @@ from tensorflow_probability.substrates import jax as tfp
 f32 = jnp.float32
 tfd = tfp.distributions
 tree_map = jax.tree_util.tree_map
-sg = lambda x: tree_map(jax.lax.stop_gradient, x)
+stop_gradient = lambda x: tree_map(jax.lax.stop_gradient, x)
 
 from . import jaxutils
 from . import ninjax as nj
 cast = jaxutils.cast_to_compute
 
+swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
 
 class RSSM(nj.Module):
 
@@ -28,7 +29,7 @@ class RSSM(nj.Module):
     self._action_clip = action_clip
     self._kw = kw
 
-  def initial(self, bs):
+  def initialize(self, bs):
     if self._classes:
       state = dict(
           deter=jnp.zeros([bs, self._deter], f32),
@@ -50,28 +51,40 @@ class RSSM(nj.Module):
     else:
       raise NotImplementedError(self._initial)
 
-  def observe(self, embed, action, is_first, state=None):
-    swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
+  def observe(self, embedded_observation, action, is_first, state=None):
+
     if state is None:
-      state = self.initial(action.shape[0])
-    step = lambda prev, inputs: self.obs_step(prev[0], *inputs)
-    inputs = swap(action), swap(embed), swap(is_first)
+      state = self.initialize(action.shape[0])
+
+    # Perform swap
+    inputs = swap(action), swap(embedded_observation), swap(is_first)
+
+    # Perform multiple observation steps
     start = state, state
-    post, prior = jaxutils.scan(step, inputs, start, self._unroll)
-    post = {k: swap(v) for k, v in post.items()}
+    step = lambda prev, inputs: self.observation_step(prev[0], *inputs)
+    posterior, prior = jaxutils.scan(step, inputs, start, self._unroll)
+
+    # Undo swap
+    posterior = {k: swap(v) for k, v in posterior.items()}
     prior = {k: swap(v) for k, v in prior.items()}
-    return post, prior
+
+    return posterior, prior
 
   def imagine(self, action, state=None):
-    swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
-    state = self.initial(action.shape[0]) if state is None else state
+    state = self.initialize(action.shape[0]) if state is None else state
     assert isinstance(state, dict), state
+
+    # Perform swap
     action = swap(action)
-    prior = jaxutils.scan(self.img_step, action, state, self._unroll)
+
+    # Perform multiple imagine steps
+    prior = jaxutils.scan(self.imagine_step, action, state, self._unroll)
+
+    # Undo swap
     prior = {k: swap(v) for k, v in prior.items()}
     return prior
 
-  def get_dist(self, state, argmax=False):
+  def get_distribution(self, state, argmax=False):
     if self._classes:
       logit = state['logit'].astype(f32)
       return tfd.Independent(jaxutils.OneHotDist(logit), 1)
@@ -80,63 +93,74 @@ class RSSM(nj.Module):
       std = state['std'].astype(f32)
       return tfp.MultivariateNormalDiag(mean, std)
 
-  def obs_step(self, prev_state, prev_action, embed, is_first):
+  def observation_step(self, prev_state, prev_action, embedded_observation, is_first):
     is_first = cast(is_first)
     prev_action = cast(prev_action)
+
     if self._action_clip > 0.0:
-      prev_action *= sg(self._action_clip / jnp.maximum(
+      prev_action *= stop_gradient(self._action_clip / jnp.maximum(
           self._action_clip, jnp.abs(prev_action)))
     prev_state, prev_action = jax.tree_util.tree_map(
         lambda x: self._mask(x, 1.0 - is_first), (prev_state, prev_action))
     prev_state = jax.tree_util.tree_map(
         lambda x, y: x + self._mask(y, is_first),
-        prev_state, self.initial(len(is_first)))
-    prior = self.img_step(prev_state, prev_action)
-    x = jnp.concatenate([prior['deter'], embed], -1)
-    x = self.get('obs_out', Linear, **self._kw)(x)
-    stats = self._stats('obs_stats', x)
-    dist = self.get_dist(stats)
-    stoch = dist.sample(seed=nj.rng())
-    post = {'stoch': stoch, 'deter': prior['deter'], **stats}
-    return cast(post), cast(prior)
+        prev_state, self.initialize(len(is_first)))
 
-  def img_step(self, prev_state, prev_action):
+    prior = self.imagine_step(prev_state, prev_action)
+
+    # Use prior and observation to get the posterior
+    x = jnp.concatenate([prior['deter'], embedded_observation], -1)
+    x = self.get('obs_out', Linear, **self._kw)(x)
+
+    stats = self._stats('obs_stats', x)
+    distribution = self.get_distribution(stats)
+    stoch = distribution.sample(seed=nj.rng())
+    posterior = {'stoch': stoch, 'deter': prior['deter'], **stats}
+
+    return cast(posterior), cast(prior)
+
+  def imagine_step(self, prev_state, prev_action):
     prev_stoch = prev_state['stoch']
     prev_action = cast(prev_action)
+
     if self._action_clip > 0.0:
-      prev_action *= sg(self._action_clip / jnp.maximum(
+      prev_action *= stop_gradient(self._action_clip / jnp.maximum(
           self._action_clip, jnp.abs(prev_action)))
+
     if self._classes:
       shape = prev_stoch.shape[:-2] + (self._stoch * self._classes,)
       prev_stoch = prev_stoch.reshape(shape)
     if len(prev_action.shape) > len(prev_stoch.shape):  # 2D actions.
       shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
       prev_action = prev_action.reshape(shape)
+
     x = jnp.concatenate([prev_stoch, prev_action], -1)
     x = self.get('img_in', Linear, **self._kw)(x)
     x, deter = self._gru(x, prev_state['deter'])
     x = self.get('img_out', Linear, **self._kw)(x)
+
     stats = self._stats('img_stats', x)
-    dist = self.get_dist(stats)
-    stoch = dist.sample(seed=nj.rng())
+    distribution = self.get_distribution(stats)
+    stoch = distribution.sample(seed=nj.rng())
     prior = {'stoch': stoch, 'deter': deter, **stats}
+
     return cast(prior)
 
   def get_stoch(self, deter):
     x = self.get('img_out', Linear, **self._kw)(deter)
     stats = self._stats('img_stats', x)
-    dist = self.get_dist(stats)
-    return cast(dist.mode())
+    distribution = self.get_distribution(stats)
+    return cast(distribution.mode())
 
   def _gru(self, x, deter):
     x = jnp.concatenate([deter, x], -1)
     kw = {**self._kw, 'act': 'none', 'units': 3 * self._deter}
     x = self.get('gru', Linear, **kw)(x)
-    reset, cand, update = jnp.split(x, 3, -1)
+    reset, candidate, update = jnp.split(x, 3, -1)
     reset = jax.nn.sigmoid(reset)
-    cand = jnp.tanh(reset * cand)
+    candidate = jnp.tanh(reset * candidate)
     update = jax.nn.sigmoid(update - 1)
-    deter = update * cand + (1 - update) * deter
+    deter = update * candidate + (1 - update) * deter
     return deter, deter
 
   def _stats(self, name, x):
@@ -159,25 +183,25 @@ class RSSM(nj.Module):
   def _mask(self, value, mask):
     return jnp.einsum('b...,b->b...', value, mask.astype(value.dtype))
 
-  def dyn_loss(self, post, prior, impl='kl', free=1.0):
+  def dynamics_loss(self, post, prior, impl='kl', free=1.0):
     if impl == 'kl':
-      loss = self.get_dist(sg(post)).kl_divergence(self.get_dist(prior))
+      loss = self.get_distribution(stop_gradient(post)).kl_divergence(self.get_distribution(prior))
     elif impl == 'logprob':
-      loss = -self.get_dist(prior).log_prob(sg(post['stoch']))
+      loss = -self.get_distribution(prior).log_prob(stop_gradient(post['stoch']))
     else:
       raise NotImplementedError(impl)
     if free:
       loss = jnp.maximum(loss, free)
     return loss
 
-  def rep_loss(self, post, prior, impl='kl', free=1.0):
+  def representation_loss(self, post, prior, impl='kl', free=1.0):
     if impl == 'kl':
-      loss = self.get_dist(post).kl_divergence(self.get_dist(sg(prior)))
+      loss = self.get_distribution(post).kl_divergence(self.get_distribution(stop_gradient(prior)))
     elif impl == 'uniform':
       uniform = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), prior)
-      loss = self.get_dist(post).kl_divergence(self.get_dist(uniform))
+      loss = self.get_distribution(post).kl_divergence(self.get_distribution(uniform))
     elif impl == 'entropy':
-      loss = -self.get_dist(post).entropy()
+      loss = -self.get_distribution(post).entropy()
     elif impl == 'none':
       loss = jnp.zeros(post['deter'].shape[:-1])
     else:

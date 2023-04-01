@@ -13,14 +13,14 @@ class Greedy(nj.Module):
   def __init__(self, wm, act_space, config):
     rewfn = lambda s: wm.heads['reward'](s).mean()[1:]
     if config.critic_type == 'vfunction':
-      critics = {'extr': agent.VFunction(rewfn, config, name='critic')}
+      critics = {'extr': agent.ValueFunction(rewfn, config, name='critic')}
     else:
       raise NotImplementedError(config.critic_type)
     self.ac = agent.ImagActorCritic(
         critics, {'extr': 1.0}, act_space, config, name='ac')
 
-  def initial(self, batch_size):
-    return self.ac.initial(batch_size)
+  def initialize(self, batch_size):
+    return self.ac.initialize(batch_size)
 
   def policy(self, latent, state):
     return self.ac.policy(latent, state)
@@ -38,7 +38,7 @@ class Random(nj.Module):
     self.config = config
     self.act_space = act_space
 
-  def initial(self, batch_size):
+  def initialize(self, batch_size):
     return jnp.zeros(batch_size)
 
   def policy(self, latent, state):
@@ -73,18 +73,18 @@ class Explore(nj.Module):
         continue
       if key == 'extr':
         rewfn = lambda s: wm.heads['reward'](s).mean()[1:]
-        critics[key] = agent.VFunction(rewfn, config, name=key)
+        critics[key] = agent.ValueFunction(rewfn, config, name=key)
       else:
         rewfn = self.REWARDS[key](
             wm, act_space, config, name=key + '_reward')
-        critics[key] = agent.VFunction(rewfn, config, name=key)
+        critics[key] = agent.ValueFunction(rewfn, config, name=key)
         self.rewards[key] = rewfn
     scales = {k: v for k, v in config.expl_rewards.items() if v}
     self.ac = agent.ImagActorCritic(
         critics, scales, act_space, config, name='ac')
 
-  def initial(self, batch_size):
-    return self.ac.initial(batch_size)
+  def initialize(self, batch_size):
+    return self.ac.initialize(batch_size)
 
   def policy(self, latent, state):
     return self.ac.policy(latent, state)
