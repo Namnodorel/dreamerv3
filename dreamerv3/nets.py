@@ -108,19 +108,24 @@ class RSSM(nj.Module):
 
     prior = self.imagine_step(prev_state, prev_action)
 
-    # Use prior and observation to get the posterior
+    # Use prior recurrent state and observation embedding to get the posterior
     x = jnp.concatenate([prior['deter'], embedded_observation], -1)
     x = self.get('obs_out', Linear, **self._kw)(x)
 
     stats = self._stats('obs_stats', x)
-    distribution = self.get_distribution(stats)
-    stoch = distribution.sample(seed=nj.rng())
-    posterior = {'stoch': stoch, 'deter': prior['deter'], **stats}
+
+    # Sample from the distribution over discrete states for the observation
+    discrete_distribution = self.get_distribution(stats)
+    predicted_embedded_observation = discrete_distribution.sample(seed=nj.rng())
+
+    posterior = {'stoch': predicted_embedded_observation, 'deter': prior['deter'], **stats}
 
     return cast(posterior), cast(prior)
 
   def imagine_step(self, prev_state, prev_action):
-    prev_stoch = prev_state['stoch']
+    """Update the recurrent state using the previous state and action."""
+
+    prev_predicted_observation_embedding = prev_state['stoch']
     prev_action = cast(prev_action)
 
     if self._action_clip > 0.0:
@@ -128,21 +133,22 @@ class RSSM(nj.Module):
           self._action_clip, jnp.abs(prev_action)))
 
     if self._classes:
-      shape = prev_stoch.shape[:-2] + (self._stoch * self._classes,)
-      prev_stoch = prev_stoch.reshape(shape)
-    if len(prev_action.shape) > len(prev_stoch.shape):  # 2D actions.
+      shape = prev_predicted_observation_embedding.shape[:-2] + (self._stoch * self._classes,)
+      prev_predicted_observation_embedding = prev_predicted_observation_embedding.reshape(shape)
+    if len(prev_action.shape) > len(prev_predicted_observation_embedding.shape):  # 2D actions.
       shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
       prev_action = prev_action.reshape(shape)
 
-    x = jnp.concatenate([prev_stoch, prev_action], -1)
+    # Perform the state update
+    x = jnp.concatenate([prev_predicted_observation_embedding, prev_action], -1)
     x = self.get('img_in', Linear, **self._kw)(x)
     x, deter = self._gru(x, prev_state['deter'])
     x = self.get('img_out', Linear, **self._kw)(x)
 
     stats = self._stats('img_stats', x)
     distribution = self.get_distribution(stats)
-    stoch = distribution.sample(seed=nj.rng())
-    prior = {'stoch': stoch, 'deter': deter, **stats}
+    embedded_observation = distribution.sample(seed=nj.rng())
+    prior = {'stoch': embedded_observation, 'deter': deter, **stats}
 
     return cast(prior)
 

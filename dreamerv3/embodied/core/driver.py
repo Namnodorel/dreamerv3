@@ -43,33 +43,52 @@ class Driver:
 
   def _step(self, policy, step, episode):
     assert all(len(x) == len(self._env) for x in self._acts.values())
+
+    # Perform stored action and retrieve observation
     acts = {k: v for k, v in self._acts.items() if not k.startswith('log_')}
     obs = self._env.step(acts)
     obs = {k: convert(v) for k, v in obs.items()}
+
     assert all(len(x) == len(self._env) for x in obs.values()), obs
+
+    # Compute the next action and internal state based on the observation
     acts, self._state = policy(obs, self._state, **self._kwargs)
+
     acts = {k: convert(v) for k, v in acts.items()}
+
+    # Store reset actions for all observations that indicated that the environment ended the episode
     if obs['is_last'].any():
       mask = 1 - obs['is_last']
       acts = {k: v * self._expand(mask, len(v.shape)) for k, v in acts.items()}
     acts['reset'] = obs['is_last'].copy()
+
+    # Store action for the next step
     self._acts = acts
-    trns = {**obs, **acts}
+
+    transitions = {**obs, **acts}
+
+    # Clear episode history for any environment that was just restarted
     if obs['is_first'].any():
-      for i, first in enumerate(obs['is_first']):
+      for env_index, first in enumerate(obs['is_first']):
         if first:
-          self._eps[i].clear()
-    for i in range(len(self._env)):
-      trn = {k: v[i] for k, v in trns.items()}
-      [self._eps[i][k].append(v) for k, v in trn.items()]
-      [fn(trn, i, **self._kwargs) for fn in self._on_steps]
+          self._eps[env_index].clear()
+
+    # Call on step listeners
+    for env_index in range(len(self._env)):
+      transition = {k: v[env_index] for k, v in transitions.items()}
+      [self._eps[env_index][k].append(v) for k, v in transition.items()]
+      [fn(transition, self._state, env_index, **self._kwargs) for fn in self._on_steps]
+      # [fn(transition, env_index, **self._kwargs) for fn in self._on_steps]
       step += 1
+
+    # Increase episode counter if necessary
     if obs['is_last'].any():
-      for i, done in enumerate(obs['is_last']):
+      for env_index, done in enumerate(obs['is_last']):
         if done:
-          ep = {k: convert(v) for k, v in self._eps[i].items()}
-          [fn(ep.copy(), i, **self._kwargs) for fn in self._on_episodes]
+          ep = {k: convert(v) for k, v in self._eps[env_index].items()}
+          [fn(ep.copy(), env_index, **self._kwargs) for fn in self._on_episodes]
           episode += 1
+
     return step, episode
 
   def _expand(self, value, dims):

@@ -64,7 +64,8 @@ class Agent(nj.Module):
 
     # Perform a step
     latent, _ = self.world_model.rssm.observation_step(
-        prev_latent, prev_action, embedded_observation, observation['is_first'])
+        prev_latent, prev_action, embedded_observation, observation['is_first']
+    )
 
     self.exploration_behavior.policy(latent, exploration_state)
     task_outs, task_state = self.task_behavior.policy(latent, task_state)
@@ -143,20 +144,25 @@ class WorldModel(nj.Module):
     self.obs_space = obs_space
     self.act_space = act_space['action']
     self.config = config
+
     shapes = {k: tuple(v.shape) for k, v in obs_space.items()}
     shapes = {k: v for k, v in shapes.items() if not k.startswith('log_')}
+
     self.encoder = nets.MultiEncoder(shapes, **config.encoder, name='enc')
     self.rssm = nets.RSSM(**config.rssm, name='rssm')
     self.heads = {
         'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec'),
         'reward': nets.MLP((), **config.reward_head, name='rew'),
-        'cont': nets.MLP((), **config.cont_head, name='cont')}
+        'cont': nets.MLP((), **config.cont_head, name='cont')
+    }
+
     self.optimizer = jaxutils.Optimizer(name='model_opt', **config.model_opt)
-    scales = self.config.loss_scales.copy()
-    image, vector = scales.pop('image'), scales.pop('vector')
-    scales.update({k: image for k in self.heads['decoder'].cnn_shapes})
-    scales.update({k: vector for k in self.heads['decoder'].mlp_shapes})
-    self.scales = scales
+
+    loss_scales = self.config.loss_scales.copy()
+    image, vector = loss_scales.pop('image'), loss_scales.pop('vector')
+    loss_scales.update({k: image for k in self.heads['decoder'].cnn_shapes})
+    loss_scales.update({k: vector for k in self.heads['decoder'].mlp_shapes})
+    self.loss_scales = loss_scales
 
   def initialize(self, batch_size):
     prev_latent = self.rssm.initialize(batch_size)
@@ -166,73 +172,106 @@ class WorldModel(nj.Module):
   def train(self, data, state):
     modules = [self.encoder, self.rssm, *self.heads.values()]
     mets, (state, outs, metrics) = self.optimizer(
-        modules, self.loss, data, state, has_aux=True)
+        modules, self.loss, data, state, has_aux=True
+    )
     metrics.update(mets)
     return state, outs, metrics
 
   def loss(self, data, state):
-    embed = self.encoder(data)
+    embedded_observation = self.encoder(data)
     prev_latent, prev_action = state
     prev_actions = jnp.concatenate([
-        prev_action[:, None], data['action'][:, :-1]], 1)
+        prev_action[:, None], data['action'][:, :-1]], 1
+    )
+    # Perform RSSM observation
     posterior, prior = self.rssm.observe(
-        embed, prev_actions, data['is_first'], prev_latent)
-    dists = {}
-    feats = {**posterior, 'embed': embed}
+        embedded_observation, prev_actions, data['is_first'], prev_latent
+    )
+
+    # Predict output observation, reward, continue distributions
+    distributions = {}
+    feats = {**posterior, 'embed': embedded_observation}
     for name, head in self.heads.items():
       out = head(feats if name in self.config.grad_heads else stop_gradient(feats))
       out = out if isinstance(out, dict) else {name: out}
-      dists.update(out)
+      distributions.update(out)
+
     losses = {}
+
+    # Compute representation/dynamics losses
     losses['dyn'] = self.rssm.dynamics_loss(posterior, prior, **self.config.dynamics_loss)
     losses['rep'] = self.rssm.representation_loss(posterior, prior, **self.config.representation_loss)
-    for key, dist in dists.items():
+
+    # Compute prediction loss
+    for key, dist in distributions.items():
       loss = -dist.log_prob(data[key].astype(jnp.float32))
-      assert loss.shape == embed.shape[:2], (key, loss.shape)
+      assert loss.shape == embedded_observation.shape[:2], (key, loss.shape)
       losses[key] = loss
-    scaled = {k: v * self.scales[k] for k, v in losses.items()}
-    model_loss = sum(scaled.values())
-    out = {'embed':  embed, 'post': posterior, 'prior': prior}
+
+    # Scale each loss by their configured weight and sum them up
+    scaled_losses = {k: v * self.loss_scales[k] for k, v in losses.items()}
+    model_loss = sum(scaled_losses.values())
+
+    out = {'embed':  embedded_observation, 'post': posterior, 'prior': prior}
     out.update({f'{k}_loss': v for k, v in losses.items()})
-    last_latent = {k: v[:, -1] for k, v in posterior.items()}
+
+    last_latent_state = {k: v[:, -1] for k, v in posterior.items()}
     last_action = data['action'][:, -1]
-    state = last_latent, last_action
-    metrics = self._metrics(data, dists, posterior, prior, losses, model_loss)
+    state = last_latent_state, last_action
+
+    metrics = self._metrics(data, distributions, posterior, prior, losses, model_loss)
+
     return model_loss.mean(), (state, out, metrics)
 
   def imagine(self, policy, start, horizon):
-    first_cont = (1.0 - start['is_terminal']).astype(jnp.float32)
+    first_continue = (1.0 - start['is_terminal']).astype(jnp.float32)
     keys = list(self.rssm.initialize(1).keys())
     start = {k: v for k, v in start.items() if k in keys}
     start['action'] = policy(start)
-    def step(prev, _):
-      prev = prev.copy()
-      state = self.rssm.imagine_step(prev, prev.pop('action'))
+
+    # Define a step: Predict the next recurrent state and compute an action using the current policy
+    def step(prev_state, _):
+      prev_state = prev_state.copy()
+      state = self.rssm.imagine_step(prev_state, prev_state.pop('action'))
       return {**state, 'action': policy(state)}
+
+    # Perform steps for the full prediction horizon
     trajectory = jaxutils.scan(
-        step, jnp.arange(horizon), start, self.config.imag_unroll)
+        step, jnp.arange(horizon), start, self.config.imag_unroll
+    )
     trajectory = {
-        k: jnp.concatenate([start[k][None], v], 0) for k, v in trajectory.items()}
+        k: jnp.concatenate([start[k][None], v], 0) for k, v in trajectory.items()
+    }
+
     cont = self.heads['cont'](trajectory).mode()
-    trajectory['cont'] = jnp.concatenate([first_cont[None], cont[1:]], 0)
+    trajectory['cont'] = jnp.concatenate([first_continue[None], cont[1:]], 0)
+
     discount = 1 - 1 / self.config.horizon
     trajectory['weight'] = jnp.cumprod(discount * trajectory['cont'], 0) / discount
+
     return trajectory
 
   def report(self, data):
     state = self.initialize(len(data['is_first']))
     report = {}
+    # Update report with metrics
     report.update(self.loss(data, state)[-1][-1])
-    context, _ = self.rssm.observe(
-        self.encoder(data)[:6, :5], data['action'][:6, :5],
-        data['is_first'][:6, :5])
-    start = {k: v[:, -1] for k, v in context.items()}
-    recon = self.heads['decoder'](context)
-    openl = self.heads['decoder'](
-        self.rssm.imagine(data['action'][:6, 5:], start))
+
+    posterior, prior = self.rssm.observe(
+        self.encoder(data)[:6, :5],
+        data['action'][:6, :5],
+        data['is_first'][:6, :5]
+    )
+
+    start = {k: v[:, -1] for k, v in posterior.items()}
+    reconstructed_observation = self.heads['decoder'](posterior)
+    open_loop_predictions = self.heads['decoder'](
+        self.rssm.imagine(data['action'][:6, 5:], start)
+    )
+    
     for key in self.heads['decoder'].cnn_shapes.keys():
       truth = data[key][:6].astype(jnp.float32)
-      model = jnp.concatenate([recon[key].mode()[:, :5], openl[key].mode()], 1)
+      model = jnp.concatenate([reconstructed_observation[key].mode()[:, :5], open_loop_predictions[key].mode()], 1)
       error = (model - truth + 1) / 2
       video = jnp.concatenate([truth, model, error], 2)
       report[f'openl_{key}'] = jaxutils.video_grid(video)
