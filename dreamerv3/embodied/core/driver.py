@@ -77,8 +77,7 @@ class Driver:
     for env_index in range(len(self._env)):
       transition = {k: v[env_index] for k, v in transitions.items()}
       [self._eps[env_index][k].append(v) for k, v in transition.items()]
-      [fn(transition, self._state, env_index, **self._kwargs) for fn in self._on_steps]
-      # [fn(transition, env_index, **self._kwargs) for fn in self._on_steps]
+      [fn(transition, env_index, **self._kwargs) for fn in self._on_steps]
       step += 1
 
     # Increase episode counter if necessary
