@@ -201,8 +201,8 @@ class DiscDist:
 
 
 def video_grid(video):
-  B, T, H, W, C = video.shape
-  return video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
+  batch_dim, time_dim, height_dim, width_dim, channel_dim = video.shape
+  return video.transpose((1, 2, 0, 3, 4)).reshape((time_dim, height_dim, batch_dim * width_dim, channel_dim))
 
 
 def balance_stats(dist, target, thres):

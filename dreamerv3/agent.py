@@ -257,6 +257,8 @@ class WorldModel(nj.Module):
     # Update report with metrics
     report.update(self.loss(data, state)[-1][-1])
 
+    # Only use the first six entries from the batch and first five from the length (?)
+
     posterior, prior = self.rssm.observe(
         self.encoder(data)[:6, :5],
         data['action'][:6, :5],
@@ -270,10 +272,16 @@ class WorldModel(nj.Module):
     )
     
     for key in self.heads['decoder'].cnn_shapes.keys():
+      # Take the first six entries from the batch
       truth = data[key][:6].astype(jnp.float32)
+      # Add the reconstructed observation from the posterior and the freely (open-loop) predicted one
       model = jnp.concatenate([reconstructed_observation[key].mode()[:, :5], open_loop_predictions[key].mode()], 1)
       error = (model - truth + 1) / 2
-      video = jnp.concatenate([truth, model, error], 2)
+
+      truth = (255*(truth - jnp.min(truth))/jnp.ptp(truth)).astype(int)    
+
+      # Place truth, model and error in a column
+      video = jnp.concatenate([truth], 2)
       report[f'openl_{key}'] = jaxutils.video_grid(video)
     return report
 
